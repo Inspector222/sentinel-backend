@@ -1,15 +1,33 @@
+from contextlib import asynccontextmanager
+
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
-from app.stellar import network_status
+from app.stellar import close_http_client, network_status, set_http_client
 from app.routers import health, events, risk
 
 settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    client = httpx.Client(
+        timeout=settings.request_timeout_seconds,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    set_http_client(client)
+    try:
+        yield
+    finally:
+        close_http_client()
+
 
 app = FastAPI(
     title="Stellar Sentinel API",
     description="Read-only Stellar account screening and Soroban contract event API.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
