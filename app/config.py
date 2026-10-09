@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +13,8 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = 8.0
     operation_scan_limit: int = 200
     activity_window_days: int = 7
+    screening_cache_ttl_seconds: int = Field(default=15, ge=0, le=300)
+    screening_cache_max_entries: int = Field(default=256, ge=1, le=10_000)
     events_lookback_ledgers: int = 50_000
     cors_origins: str = "http://localhost:3000"
 

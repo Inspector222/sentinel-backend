@@ -76,3 +76,5 @@ Do not commit `.env`, account secrets, signing keys, or tokens. The current serv
 ## Data and scoring limits
 
 The score uses a bounded sample of recent Horizon operations, up to 200, and fixed baseline thresholds. It is not a trained model. RPC event history is provider-limited and is not a complete archive. Configure a persistent indexer for long-term event history.
+
+Successful screening responses may be cached in-process for `SCREENING_CACHE_TTL_SECONDS` (default 15 seconds), keyed by network, Horizon URL, account, and active settings. The cache is bounded by `SCREENING_CACHE_MAX_ENTRIES` (default 256); set the TTL to `0` to disable it. Each worker has its own cache.

@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
 
@@ -9,6 +10,13 @@ from app.main import app
 
 client = TestClient(app)
 ADDRESS = "G" + "A" * 55
+
+
+@pytest.fixture(autouse=True)
+def reset_screening_cache():
+    stellar.clear_screening_cache()
+    yield
+    stellar.clear_screening_cache()
 
 
 def test_health_and_cors():
@@ -33,6 +41,74 @@ def test_score_uses_horizon_data_and_returns_bounded_explainable_signals(monkeyp
     assert payload["metrics"]["transfer_volume_xlm"] == 12000
     assert payload["signals"][0]["source"] == "Stellar Horizon account operations"
     assert client.post("/risk/score", json={"address": ADDRESS, "recent_tx_count": 10}).status_code == 422
+
+
+def test_screening_cache_reuses_results_and_returns_independent_copies(monkeypatch):
+    calls = []
+
+    def fake_get(url, params=None, settings=None):
+        calls.append(url)
+        if url.endswith("/accounts/" + ADDRESS):
+            return {"sequence": "10", "balances": []}
+        return {"_embedded": {"records": []}}
+
+    monkeypatch.setattr(stellar, "_get", fake_get)
+    settings = Settings(screening_cache_ttl_seconds=15)
+
+    first = stellar.score_account(ADDRESS, settings=settings)
+    first["score"] = 99
+    second = stellar.score_account(ADDRESS, settings=settings)
+
+    assert len(calls) == 2
+    assert second["score"] == 0
+
+
+def test_screening_cache_expires_and_isolated_by_network(monkeypatch):
+    calls = []
+    clock = {"now": 100.0}
+
+    def fake_get(url, params=None, settings=None):
+        calls.append(url)
+        if url.endswith("/accounts/" + ADDRESS):
+            return {"sequence": "10", "balances": []}
+        return {"_embedded": {"records": []}}
+
+    monkeypatch.setattr(stellar, "_get", fake_get)
+    monkeypatch.setattr(stellar.time, "monotonic", lambda: clock["now"])
+    default = Settings(screening_cache_ttl_seconds=5)
+    stellar.score_account(ADDRESS, settings=default)
+    clock["now"] = 106.0
+    stellar.score_account(ADDRESS, settings=default)
+    stellar.score_account(ADDRESS, settings=Settings(
+        network_passphrase="Different network",
+        screening_cache_ttl_seconds=5,
+    ))
+
+    assert len(calls) == 6
+
+
+def test_screening_cache_entry_limit_and_zero_ttl(monkeypatch):
+    calls = []
+    second_address = "G" + "C" * 55
+
+    def fake_get(url, params=None, settings=None):
+        calls.append(url)
+        if "/accounts/" in url:
+            return {"sequence": "10", "balances": []}
+        return {"_embedded": {"records": []}}
+
+    monkeypatch.setattr(stellar, "_get", fake_get)
+    bounded = Settings(screening_cache_ttl_seconds=15, screening_cache_max_entries=1)
+    stellar.score_account(ADDRESS, settings=bounded)
+    stellar.score_account(second_address, settings=bounded)
+    stellar.score_account(ADDRESS, settings=bounded)
+    assert len(calls) == 6
+
+    calls.clear()
+    disabled = Settings(screening_cache_ttl_seconds=0)
+    stellar.score_account(ADDRESS, settings=disabled)
+    stellar.score_account(ADDRESS, settings=disabled)
+    assert len(calls) == 4
 
 
 def test_events_requires_contract_id():
