@@ -4,6 +4,7 @@ import base64
 import copy
 from collections import OrderedDict
 import threading
+from email.utils import parsedate_to_datetime
 import time
 import math
 
@@ -49,6 +50,46 @@ def _store_screening(key: tuple, result: dict, settings: Settings) -> None:
         _screening_cache.move_to_end(key)
         while len(_screening_cache) > settings.screening_cache_max_entries:
             _screening_cache.popitem(last=False)
+_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_after_seconds(response: httpx.Response, settings: Settings, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    delay = None
+    if retry_after:
+        try:
+            delay = max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+    if delay is None:
+        delay = settings.upstream_retry_backoff_seconds * (2 ** attempt)
+    return min(delay, settings.upstream_retry_after_cap_seconds)
+
+
+def _request_with_retries(method, url: str, settings: Settings, **kwargs) -> httpx.Response:
+    retries = settings.upstream_max_retries
+    for attempt in range(retries + 1):
+        try:
+            response = method(url, **kwargs)
+        except httpx.TransportError:
+            if attempt >= retries:
+                raise
+            delay = settings.upstream_retry_backoff_seconds * (2 ** attempt)
+            time.sleep(min(delay, settings.upstream_retry_after_cap_seconds))
+            continue
+
+        if response.status_code in _RETRYABLE_STATUS_CODES and attempt < retries:
+            time.sleep(_retry_after_seconds(response, settings, attempt))
+            continue
+        return response
+
+    raise RuntimeError("upstream retry loop ended unexpectedly")
 _http_client: httpx.Client | None = None
 
 
@@ -80,10 +121,25 @@ def _post_response(url: str, payload: dict, settings: Settings):
     return httpx.post(url, json=payload, timeout=settings.request_timeout_seconds)
 
 
+def _finite_float(value) -> float:
+    """Parse an upstream numeric field without allowing NaN or infinity through."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
 def _get(url: str, params: dict | None = None, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     try:
-        response = _get_response(url, params, settings)
+        response = _request_with_retries(
+            lambda target, **kwargs: _get_response(target, kwargs.get("params"), settings),
+            url,
+            settings,
+            params=params,
+            timeout=settings.request_timeout_seconds,
+        )
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as exc:
@@ -145,10 +201,12 @@ def _asset_context(account: dict) -> tuple[list[dict], int, float]:
 def _rpc(method: str, params: dict, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     try:
-        response = _post_response(
+        response = _request_with_retries(
+            lambda target, **kwargs: _post_response(target, kwargs.get("json"), settings),
             settings.soroban_rpc_url,
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             settings,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=settings.request_timeout_seconds,
         )
         response.raise_for_status()
         payload = response.json()
@@ -217,14 +275,11 @@ def _score_account_uncached(address: str, settings: Settings) -> dict:
         for account_id in (source, destination, op.get("from")):
             if account_id and account_id != address:
                 counterparties.add(account_id)
-        try:
-            # Only native XLM amounts are included; asset amounts are never mixed into XLM totals.
-            if op.get("type") == "create_account":
-                volume += abs(float(op.get("starting_balance", "0")))
-            elif op.get("asset_type") in (None, "native"):
-                volume += abs(float(op.get("amount", "0")))
-        except (TypeError, ValueError):
-            pass
+        # Only native XLM amounts are included; asset amounts are never mixed into XLM totals.
+        if op.get("type") == "create_account":
+            volume += abs(_finite_float(op.get("starting_balance", "0")))
+        elif op.get("asset_type") in (None, "native"):
+            volume += abs(_finite_float(op.get("amount", "0")))
         transfers += 1
 
     signals = []
@@ -277,6 +332,7 @@ def _score_account_uncached(address: str, settings: Settings) -> dict:
         "risk_level": "high" if score >= threshold else "elevated" if score >= settings.risk_elevated_score_threshold else "low",
         "threshold": threshold,
         "threshold_exceeded": score >= threshold,
+        "scoring_policy_version": settings.risk_policy_version,
         "signals": signals,
         "metrics": {"operations_scanned": len(records), "operations_in_window": len(recent),
                     "transfers_in_window": transfers, "transfer_volume_xlm": round(volume, 7),
